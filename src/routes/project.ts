@@ -1,39 +1,53 @@
 import express, { type Request, type Response } from 'express';
 import { createTaskSchema, patchTaskSchema } from '../validators/task.ts';
+import { createProjectSchema } from '../validators/project.ts';
+import { addProjectMemberSchema } from '../validators/projectMember.ts';
 import { prisma } from '../../lib/prisma.ts';
+import { Prisma } from '../generated/prisma/client.ts';
+import { ProjectRole } from '../generated/prisma/enums.ts';
 import { loadProject } from '../middleware/project.ts';
+import { loadTask } from '../middleware/task.ts';
 import { validateBody } from '../middleware/validate.ts';
+import { auth } from '../middleware/auth.middleware.ts';
+import { requireProjectMember, requireProjectOwner } from '../middleware/authorization.middleware.ts';
 
 const router = express.Router();
 
-router.get('/', async (_req: Request, res: Response) => {
+router.get('/', auth, async (_req: Request, res: Response) => {
     const projects = await prisma.project.findMany();
     return res.json(projects);
 });
 
-router.get('/:id', loadProject, (_req: Request, res: Response) => {
+router.get('/:id', auth, loadProject, requireProjectMember, (_req: Request, res: Response) => {
     return res.json(res.locals.project);
 });
 
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', auth, validateBody(createProjectSchema), async (req: Request, res: Response) => {
     const { name, description } = req.body;
 
-    if (!name || !description) {
-        return res.status(400).json({ status: 400, message: 'name and description are required' });
-    }
+    const userId = res.locals.user.sub as string;
 
     const newProject = await prisma.project.create({
         data: {
             name,
             description,
             createdAt: new Date(),
-        }
+            members: {
+                create: {
+                    userId,
+                    role: ProjectRole.OWNER,
+                },
+            },
+        },
+        include: {
+            members: true,
+        },
     });
 
     return res.status(201).json(newProject);
 });
 
-router.get('/:id/tasks', loadProject, async (_req: Request, res: Response) => {
+router.get('/:id/tasks',auth, loadProject,requireProjectMember, async (_req: Request, res: Response) => {
     const tasks = await prisma.task.findMany({
         where: { projectId: res.locals.project.id },
     });
@@ -41,7 +55,7 @@ router.get('/:id/tasks', loadProject, async (_req: Request, res: Response) => {
     return res.status(200).json(tasks);
 });
 
-router.post('/:id/tasks', loadProject, validateBody(createTaskSchema), async (req: Request, res: Response) => {
+router.post('/:id/tasks', auth, loadProject, requireProjectOwner, validateBody(createTaskSchema), async (req: Request, res: Response) => {
     const { name, description } = req.body;
 
     const newTask = await prisma.task.create({
@@ -56,33 +70,53 @@ router.post('/:id/tasks', loadProject, validateBody(createTaskSchema), async (re
     return res.status(201).json(newTask);
 });
 
-router.patch('/tasks/:taskId', validateBody(patchTaskSchema), async (req: Request, res: Response) => {
-    const taskId = req.params.taskId as string;
+router.post('/:id/members', auth, loadProject, requireProjectOwner, validateBody(addProjectMemberSchema), async (req: Request, res: Response) => {
+    const { email, role } = req.body;
 
-    const task = await prisma.task.findUnique({ where: { id: taskId } });
-    if (!task) {
-        return res.status(404).json({ status: 404, message: 'Task not found' });
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) {
+        return res.status(404).json({ status: 404, message: 'User not found' });
     }
 
+    try {
+        const membership = await prisma.projectMember.create({
+            data: {
+                userId: user.id,
+                projectId: res.locals.project.id,
+                role: role ?? ProjectRole.MEMBER,
+            },
+            select: {
+                projectId: true,
+                role: true,
+                createdAt: true,
+                user: { select: { id: true, name: true, email: true } },
+            },
+        });
+
+        return res.status(201).json(membership);
+    } catch (error) {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+            return res.status(409).json({ status: 409, message: 'User is already a member of this project' });
+        }
+        throw error;
+    }
+});
+
+router.patch('/tasks/:taskId', auth, loadTask, requireProjectOwner, validateBody(patchTaskSchema), async (req: Request, res: Response) => {
     const updatedTask = await prisma.task.update({
-        where: { id: taskId },
+        where: { id: res.locals.task.id },
         data: req.body,
     });
 
     return res.status(200).json(updatedTask);
 });
 
-router.delete('/tasks/:taskId', async (req: Request, res: Response) => {
-    const taskId = req.params.taskId as string;
-
-    const task = await prisma.task.findUnique({ where: { id: taskId } });
-    if (!task) {
-        return res.status(404).json({ status: 404, message: 'Task not found' });
-    }
-
-    await prisma.task.delete({ where: { id: taskId } });
+router.delete('/tasks/:taskId', auth, loadTask, requireProjectOwner, async (_req: Request, res: Response) => {
+    await prisma.task.delete({ where: { id: res.locals.task.id } });
 
     return res.status(204).send();
 });
+
+
 
 export default router;

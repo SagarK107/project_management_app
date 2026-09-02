@@ -6,10 +6,12 @@ export function validateBody<T extends z.ZodType>(schema: T) {
         
         const result = schema.safeParse(req.body);
         if (!result.success) {
+            const { fieldErrors, formErrors } = z.flattenError(result.error);
             return res.status(400).json({
                 status: 400,
                 message: 'Invalid data',
-                errors: z.flattenError(result.error).fieldErrors,
+                errors: fieldErrors,
+                formErrors,
             });
         }
 
